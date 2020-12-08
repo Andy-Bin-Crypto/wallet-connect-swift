@@ -9,9 +9,11 @@ import Starscream
 import PromiseKit
 
 public typealias SessionRequestClosure = (_ id: Int64, _ peerParam: WCSessionRequestParam) -> Void
+public typealias SessionUpdateClosure = (_ id: Int64, _ peerParam: WCSessionUpdateParam) -> Void
 public typealias DisconnectClosure = (Error?) -> Void
 public typealias CustomRequestClosure = (_ id: Int64, _ request: [String: Any]) -> Void
 public typealias ErrorClosure = (Error) -> Void
+public typealias StateClosure = (WCInteractorState) -> Void
 
 public enum WCInteractorState {
     case connected
@@ -23,7 +25,11 @@ public enum WCInteractorState {
 open class WCInteractor {
     public let session: WCSession
 
-    public private(set) var state: WCInteractorState
+    public private(set) var state: WCInteractorState {
+        didSet {
+            onConnectStateChange?(state)
+        }
+    }
 
     public let clientId: String
     public let clientMeta: WCPeerMeta
@@ -34,9 +40,11 @@ open class WCInteractor {
 
     // incoming event handlers
     public var onSessionRequest: SessionRequestClosure?
+    public var onSessionUpdate: SessionUpdateClosure?
     public var onDisconnect: DisconnectClosure?
     public var onError: ErrorClosure?
     public var onCustomRequest: CustomRequestClosure?
+    public var onConnectStateChange: StateClosure?
 
     // outgoing promise resolvers
     private var connectResolver: Resolver<Bool>?
@@ -73,7 +81,7 @@ open class WCInteractor {
     }
 
     deinit {
-        disconnect()
+        pause()
     }
 
     open func connect() -> Promise<Bool> {
@@ -105,8 +113,6 @@ open class WCInteractor {
 
         connectResolver = nil
         handshakeId = -1
-
-        WCSessionStore.clear(session.topic)
     }
 
     open func approveSession(accounts: [String], chainId: Int) -> Promise<Void> {
@@ -121,7 +127,13 @@ open class WCInteractor {
             peerMeta: clientMeta
         )
         let response = JSONRPCResponse(id: handshakeId, result: result)
-        return encryptAndSend(data: response.encoded)
+        return encryptAndSend(data: response.encoded).map { [weak self] (_) -> Void in
+            guard let session = self?.session,
+                  let peerId = self?.peerId,
+                  let peerMeta = self?.peerMeta else {
+                return
+            }
+        }
     }
 
     open func rejectSession(_ message: String = "Session Rejected") -> Promise<Void> {
@@ -201,9 +213,8 @@ extension WCInteractor {
             // topic == clientId
             let request: JSONRPCRequest<[WCSessionUpdateParam]> = try event.decode(decrypted)
             guard let param = request.params.first else { throw WCError.badJSONRPCRequest }
-            if param.approved == false {
-                disconnect()
-            }
+            sessionTimer?.invalidate()
+            onSessionUpdate?(request.id, param)
         default:
             if WCEvent.eth.contains(event) {
                 try eth.handleEvent(event, topic: topic, decrypted: decrypted)
